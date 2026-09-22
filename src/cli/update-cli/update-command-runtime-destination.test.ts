@@ -7,8 +7,13 @@ import {
   createMockGatewayService,
   mockSystemAccountHome,
 } from "../../daemon/service.test-helpers.js";
+import {
+  resolveCommandProcessSignal,
+  retainCommandProcessCleanup,
+} from "../../process/exec-spawn.js";
 import * as processExec from "../../process/exec.js";
 import { defaultRuntime, ExitError } from "../../runtime.js";
+import { createDeferredCore } from "../../shared/deferred.js";
 import { createCommandResult } from "../../test-utils/npm-spec-install-test-helpers.js";
 import { quoteCliArg, quotePowerShellArg } from "../quote-cli-arg.js";
 import { installFreshUpdateFixture } from "./update-command-fresh.test-support.js";
@@ -26,12 +31,79 @@ import { updateCommand } from "./update-command.js";
 vi.mock("../../infra/container-environment.js", () => ({ isContainerEnvironment: () => false }));
 const { fixture } = installFreshUpdateFixture();
 
+it.each(["forced", "uncertain"] as const)(
+  "settles npm destination inspection before publishing refusal (%s)",
+  async (cleanupResult) => {
+    vi.mocked(packageDestination.inspectNpmGlobalDestination).mockRestore();
+    const cleanup = createDeferredCore<"forced" | "uncertain">();
+    const joining = createDeferredCore();
+    const writes = vi.spyOn(packageUpdate, "runPackageInstallUpdate");
+    vi.spyOn(processExec, "runCommandWithTimeout").mockImplementation(async (argv) => {
+      expect(argv).toContain("prefix");
+      retainCommandProcessCleanup(cleanup.promise);
+      resolveCommandProcessSignal()?.addEventListener("abort", () => joining.resolve(), {
+        once: true,
+      });
+      throw new Error("npm prefix probe cancelled");
+    });
+    const launcher = path.join(fixture.root, "openclaw.mjs");
+    await fs.writeFile(launcher, "// original deployment\n");
+    const work = updateCommand({ tag: "2026.9.2", json: true, yes: true, dryRun: true }).catch(
+      (error: unknown) => error,
+    );
+    try {
+      await Promise.race([
+        joining.promise,
+        work.then(() => {
+          throw new Error("npm destination refusal escaped cleanup ownership");
+        }),
+      ]);
+      expect(defaultRuntime.writeJson).not.toHaveBeenCalled();
+      expect(defaultRuntime.error).not.toHaveBeenCalled();
+      expect(writes).not.toHaveBeenCalled();
+      expect(packageUpdate.stagePackageInstallUpdate).not.toHaveBeenCalled();
+    } finally {
+      cleanup.resolve(cleanupResult);
+      await work;
+    }
+    expect(defaultRuntime.writeJson).toHaveBeenCalledOnce();
+    expect(defaultRuntime.writeJson).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "error",
+        reason:
+          cleanupResult === "uncertain"
+            ? "update-admission-cleanup-failed"
+            : "global-install-foreign-destination",
+        failedStep: expect.objectContaining({
+          failureFacts: [expect.objectContaining({ code: "global-install-foreign-destination" })],
+        }),
+        ...(cleanupResult === "uncertain"
+          ? { recovery: { serviceRestartSafe: false, reason: "runtime-verification-failed" } }
+          : {}),
+      }),
+    );
+    if (cleanupResult === "uncertain") {
+      expect(await work).toEqual(new ExitError(1));
+    } else {
+      expect(await work).toMatchObject({
+        result: { reason: "global-install-foreign-destination" },
+      });
+    }
+    expect(writes).not.toHaveBeenCalled();
+    expect(packageUpdate.stagePackageInstallUpdate).not.toHaveBeenCalled();
+    expect(await fs.readFile(launcher, "utf8")).toBe("// original deployment\n");
+  },
+);
+
 it.each([
   "foreign",
+  "foreign-managed",
+  "foreign-sealed",
   "unverified",
   "claimed",
   "foreign-launcher",
   "owned",
+  "prefix-alias",
   "empty",
   "EACCES",
   "EPERM",
@@ -47,7 +119,9 @@ it.each([
     vi.stubEnv("OPENCLAW_PROFILE", undefined);
     const base = path.dirname(fixture.root);
     const oldRoot = fixture.root;
+    const managedForeign = destination === "foreign-managed" || destination === "foreign-sealed";
     const selected = path.join(base, "selected");
+    const prefixAlias = path.join(base, "selected-alias");
     const newRoot = path.join(
       selected,
       process.platform === "win32" ? "node_modules" : "lib/node_modules",
@@ -57,15 +131,27 @@ it.each([
     await fs.mkdir(path.dirname(newRoot), { recursive: true });
     await fs.mkdir(bin, { recursive: true });
     await fs.writeFile(path.join(oldRoot, "openclaw.mjs"), "// original deployment\n");
-    if (destination === "foreign" || destination === "unverified" || destination === "claimed") {
+    if (
+      destination === "foreign" ||
+      destination === "unverified" ||
+      destination === "claimed" ||
+      managedForeign
+    ) {
       await fs.mkdir(newRoot);
       await fs.writeFile(
         path.join(newRoot, "package.json"),
         JSON.stringify({ name: "openclaw", version: "2026.8.1" }),
       );
       await fs.writeFile(path.join(newRoot, "openclaw.mjs"), "// foreign deployment\n");
-    } else if (destination === "owned" || destination === "foreign-launcher") {
+    } else if (
+      destination === "owned" ||
+      destination === "prefix-alias" ||
+      destination === "foreign-launcher"
+    ) {
       await fs.symlink(oldRoot, newRoot, process.platform === "win32" ? "junction" : "dir");
+    }
+    if (destination === "prefix-alias") {
+      await fs.symlink(selected, prefixAlias, process.platform === "win32" ? "junction" : "dir");
     }
     const probeFailure = destination.startsWith("probe-");
     const unknown =
@@ -95,7 +181,7 @@ it.each([
         );
       }
     }
-    if (destination === "claimed" || destination === "unverified") {
+    if (destination === "claimed" || destination === "unverified" || managedForeign) {
       mockSystemAccountHome();
       vi.stubEnv("OPENCLAW_HOME", undefined);
       vi.stubEnv("OPENCLAW_PROFILE", undefined);
@@ -109,14 +195,23 @@ it.each([
             status: destination === "unverified" ? "unknown" : "stopped",
             systemd: { managerUid: 2001 },
           }),
+          readDefinitionMutationCapability: async () =>
+            destination === "foreign-sealed"
+              ? { kind: "sealed", reason: "sealed-mount" }
+              : { kind: "writable" },
           readCommand: async () => ({
-            programArguments: [process.execPath, path.join(newRoot, "openclaw.mjs"), "gateway"],
+            programArguments: [
+              process.execPath,
+              path.join(managedForeign ? oldRoot : newRoot, "openclaw.mjs"),
+              "gateway",
+            ],
             sourcePath: path.join(base, "selected-gateway.service"),
           }),
         }),
       );
     }
     const foreign =
+      managedForeign ||
       destination === "foreign" ||
       destination === "unverified" ||
       destination === "foreign-launcher";
@@ -164,7 +259,7 @@ it.each([
           argv.includes("prefix") && destination !== "probe-empty"
             ? destination === "probe-relative"
               ? "relative/prefix\n"
-              : `${selected}\n`
+              : `${destination === "prefix-alias" ? prefixAlias : selected}\n`
             : "",
       }),
     );
@@ -188,15 +283,29 @@ it.each([
             : destination === "empty"
               ? "empty"
               : "owned",
-      prefix: probeFailure ? null : selected,
+      prefix: probeFailure ? null : destination === "prefix-alias" ? prefixAlias : selected,
       ...(unknown || destination === "foreign-launcher" ? { cause: unknownCause } : {}),
     });
     if (foreign || unknown) {
       expect(result).toMatchObject({
         status: "error",
         reason: "global-install-foreign-destination",
-        failedStep: { failureFacts: [{ code: "global-install-foreign-destination" }] },
+        failedStep: {
+          failureFacts: [
+            expect.objectContaining({
+              code: "global-install-foreign-destination",
+              destination: expect.objectContaining({
+                ownership: unknown || destination === "foreign-launcher" ? "unknown" : "foreign",
+                prefix: probeFailure ? null : `~${path.sep}selected`,
+                runningRoot: `~${path.sep}installation`,
+              }),
+            }),
+          ],
+        },
       });
+      expect(JSON.stringify(result)).toContain(
+        "https://docs.openclaw.ai/install/update-troubleshooting#node-and-global-install-permissions",
+      );
     } else {
       expect(result).toMatchObject({ dryRun: true, root: oldRoot });
     }
@@ -205,7 +314,24 @@ it.each([
       const entry = await fs.realpath(path.join(newRoot, "openclaw.mjs"));
       expect(result).toMatchObject({
         failedStep: {
-          stderrTail: `Selected npm destination ${selected} is occupied by another OpenClaw installation: package ${newRoot}; launcher ${launcher} -> ${entry}. No selected managed service could be verified as owning this destination. No installation was attempted. Switch the runtime back and run \`node ${quote(path.join(oldRoot, "openclaw.mjs"))} update\`. Alternatively, ask the destination's deployment owner to resolve its package/launcher and select it for the intended service using their deployment procedure. Do not overwrite it.`,
+          stderrTail: expect.stringContaining(
+            `Selected npm destination ${selected} is occupied by another OpenClaw installation: package ${newRoot}; launcher ${launcher} -> ${entry}. No selected managed service could be verified as owning this destination. No installation was attempted. Switch the runtime back and run \`node ${quote(path.join(oldRoot, "openclaw.mjs"))} update\`. Alternatively, ask the destination's deployment owner to resolve its package/launcher and select it for the intended service using their deployment procedure. Do not overwrite it.`,
+          ),
+        },
+      });
+    }
+    if (managedForeign) {
+      const launcher = path.join(bin, process.platform === "win32" ? "openclaw.cmd" : "openclaw");
+      const entry = await fs.realpath(path.join(newRoot, "openclaw.mjs"));
+      const alternative =
+        destination === "foreign-sealed"
+          ? "Alternatively, ask the destination's deployment owner to resolve its package/launcher and select it for the intended service using their deployment procedure. Do not overwrite it."
+          : `Alternatively, if the destination's owner agrees to use it for this service, explicitly select it with \`node ${quote(entry)} gateway install --force --runtime-path ${quote(process.execPath)}\` and rerun the update. This changes the service binding; it does not grant ownership of another deployment's package.`;
+      expect(result).toMatchObject({
+        failedStep: {
+          stderrTail: expect.stringContaining(
+            `Selected npm destination ${selected} is occupied by another OpenClaw installation: package ${newRoot}; launcher ${launcher} -> ${entry}. The selected service (${path.join(base, "selected-gateway.service")}) uses ${path.join(oldRoot, "openclaw.mjs")}; it does not own this destination. No installation was attempted. Switch the runtime back and run \`node ${quote(path.join(oldRoot, "openclaw.mjs"))} update\`. ${alternative}`,
+          ),
         },
       });
     }
@@ -213,7 +339,9 @@ it.each([
       const prefix = probeFailure ? "(unresolved; npm prefix -g)" : selected;
       expect(result).toMatchObject({
         failedStep: {
-          stderrTail: `Selected npm destination ${prefix} could not be inspected (${unknownCause}); ownership is unknown. No installation was attempted. Fix inspection permissions on this prefix for the service account, or make \`npm prefix -g\` succeed with the selected runtime, then run \`node ${quote(path.join(oldRoot, "openclaw.mjs"))} update\`. Alternatively, ask the deployment owner to verify the layout and explicitly select the intended installation using its existing deployment procedure.`,
+          stderrTail: expect.stringContaining(
+            `Selected npm destination ${prefix} could not be inspected (${unknownCause}); ownership is unknown. No installation was attempted. Fix inspection permissions on this prefix for the service account, or make \`npm prefix -g\` succeed with the selected runtime, then run \`node ${quote(path.join(oldRoot, "openclaw.mjs"))} update\`. Alternatively, ask the deployment owner to verify the layout and explicitly select the intended installation using its existing deployment procedure.`,
+          ),
         },
       });
     }
@@ -230,7 +358,7 @@ it.each([
     expect(await fs.readFile(path.join(oldRoot, "openclaw.mjs"), "utf8")).toBe(
       "// original deployment\n",
     );
-    if (destination === "foreign" || destination === "unverified") {
+    if (destination === "foreign" || destination === "unverified" || managedForeign) {
       expect(await fs.readFile(path.join(newRoot, "openclaw.mjs"), "utf8")).toBe(
         "// foreign deployment\n",
       );
